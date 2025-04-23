@@ -1,2 +1,7 @@
 *.zip
 data/
+*.pt
+temp*
+*.png
+.pytest_cache
+*pkl
