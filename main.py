@@ -80,7 +80,7 @@ def log_likelihood(matrix: torch.Tensor, U: torch.Tensor, V: torch.Tensor):
     Computes the log-likelihood of observed ratings given latent vectors.
     """
     pred = sigmoid(U @ V.T)
-    observed = matrix != -1
+    observed = matrix >= 0
     error = matrix[observed] - pred[observed]
     return -0.5 * torch.sum(error**2) / SIGMA2
 
@@ -173,26 +173,19 @@ def unnormalize(preds: torch.Tensor):
 
 
 def compute_rmse(test_matrix: torch.Tensor, pred_matrix: torch.Tensor):
-    observed = test_matrix != -1
+    observed = test_matrix >= 0
     rmse = torch.sqrt(
         ((test_matrix[observed] - unnormalize(pred_matrix[observed])) ** 2).mean()
     )
     return rmse.item()
 
 
-class Sampler:
+class Sampler(ABC):
     def __init__(self, matrix: torch.Tensor):
+        self.matrix = matrix
         self.N, self.M = matrix.shape
-        self._U = torch.randn((self.N, K), device=dev)
-        self._V = torch.randn((self.M, K), device=dev)
-
-    @property
-    def U(self):
-        return self._U
-
-    @property
-    def V(self):
-        return self._V
+        self.U: torch.Tensor = torch.randn((self.N, K), device=dev)
+        self.V: torch.Tensor = torch.randn((self.M, K), device=dev)
 
     @abstractmethod
     def sample(self):
@@ -201,56 +194,66 @@ class Sampler:
         """
         pass
 
+    @abstractmethod
+    def __str__(self) -> str:
+        pass
+
 
 class MetropolisHastingsSampler(Sampler):
     def __init__(self, matrix: torch.Tensor, proposal_std: float = PROPOSAL_STD):
         super().__init__(matrix)
         self.proposal_std = proposal_std
-        cur_log_post = log_posterior(matrix, U, V)
+        self.cur_log_post = log_posterior(self.matrix, self.U, self.V)
+        self.total_samples = 0
+        self.accepted_samples = 0
 
     def sample(self):
+        self.total_samples += 1
+
         # Proposal step: sample new candidate latent vectors (z*) from proposal q(z* | z)
-        U_prop = self._U + torch.randn_like(self._U) * self.proposal_std
+        U_prop = self.U + torch.randn_like(self.U) * self.proposal_std
         V_prop = self.V + torch.randn_like(self.V) * self.proposal_std
 
         # Evaluate posterior of proposed state
-        prop_log_post = log_posterior(matrix, U_prop, V_prop)
+        prop_log_post = log_posterior(self.matrix, U_prop, V_prop)
 
         # Compute Metropolis-Hastings acceptance ratio A(z*, z)
-        accept_log_ratio = prop_log_post - cur_log_post
+        accept_log_ratio = prop_log_post - self.cur_log_post
         # Accept proposal with probability min(1, A(z*, z))
         if torch.log(torch.rand(1, device=dev)) < accept_log_ratio:
-            U, V = U_prop, V_prop  # type: ignore
-            cur_log_post = prop_log_post
-            accepted_samples += 1
+            self.U, self.V = U_prop, V_prop
+            self.cur_log_post = prop_log_post
+            self.accepted_samples += 1
+
+    def __str__(self) -> str:
+        return f"[MH Sampler] Log posterior: {self.cur_log_post.item():.2f}. Accepted: {self.accepted_samples}, Rate: {self.accepted_samples / (self.total_samples):.2f}"
 
 
-def metropolis_hastings(
+
+def run_simulation(
     matrix: torch.Tensor,
     num_samples: int = NUM_SAMPLES,
-    proposal_std: float = PROPOSAL_STD,
     burnin: int = BURNIN,
     thin: int = THIN,
     *,
     test_matrix: torch.Tensor | None = None,
 ):
     N, M = matrix.shape
-    U = torch.randn((N, K), device=dev)
-    V = torch.randn((M, K), device=dev)
     errors: list[tuple[float, int]] = []
 
     pred_matrix = torch.zeros((N, M), device=dev)
     samples: int = 0
-    accepted_samples = 0
+    sampler: Sampler = MetropolisHastingsSampler(matrix)
 
     for i in trange(num_samples):
         try:
-
+            sampler.sample()
             # Store avg sample
             if i >= burnin and i % thin == 0:
                 samples += 1
                 pred_matrix = (
-                    pred_matrix * (samples - 1) / samples + sigmoid(U @ V.T) / samples
+                    pred_matrix * (samples - 1) / samples
+                    + sigmoid(sampler.U @ sampler.V.T) / samples
                 )
 
             if i % LOG_AFTER == 0:
@@ -259,7 +262,7 @@ def metropolis_hastings(
                     rmse = compute_rmse(test_matrix, pred_matrix)
                     errors.append((rmse, i))
                 tqdm.write(
-                    f"[Sample {i}] Log posterior: {cur_log_post.item():.2f}. Accepted: {accepted_samples}, Rate: {accepted_samples / (i + 1):.2f}"
+                    f"[Sample {i}] {sampler}"
                     + (f", RMSE: {rmse:.6f}" if rmse is not None else "")
                 )
         except KeyboardInterrupt:
@@ -301,18 +304,20 @@ def main():
     shuffle(data)
     test = data[: int(len(data) * TEST_SIZE)]
     train = data[int(len(data) * TEST_SIZE) :]
-    tqdm.write(f"Train size: {len(train)}, Test size: {len(test)}")
 
     num_movies = max(row.movieId for row in data)
     num_users = max(row.userId for row in data)
     train_matrix = create_matrix(train, num_users, num_movies)
     test_matrix = create_matrix(test, num_users, num_movies)
 
+    tqdm.write(
+        f"Train size: {len(train)}, Test size: {len(test)}, matrix size: {train_matrix.shape}"
+    )
+
     errors: list[tuple[float, int]] = []
 
-    if not os.path.exists("samples.pt"):
-        errors = metropolis_hastings(train_matrix, test_matrix=test_matrix)
-        torch.save(samples, "samples.pt")  # type: ignore
+    if not os.path.exists("errors.pt"):
+        errors = run_simulation(train_matrix, test_matrix=test_matrix)
         torch.save(errors, "errors.pt")  # type: ignore
     else:
         errors = torch.load("errors.pt")  # type: ignore
@@ -322,12 +327,12 @@ def main():
 
     # plot errors
     if errors:
-        errors = np.array(errors)
-        plt.plot(errors[:, 1], errors[:, 0])
-        plt.xlabel("Sample")
-        plt.ylabel("RMSE")
-        plt.title("RMSE over samples")
-        plt.show()
+        errors = np.array(errors)  # type: ignore
+        plt.plot(errors[:, 1], errors[:, 0])  # type: ignore
+        plt.xlabel("Sample")  # type: ignore
+        plt.ylabel("RMSE")  # type: ignore
+        plt.title("RMSE over samples")  # type: ignore
+        plt.show()  # type: ignore
 
 
 if __name__ == "__main__":
