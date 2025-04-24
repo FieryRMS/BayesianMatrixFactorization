@@ -1,6 +1,7 @@
 import os
 import pickle
 import random
+from abc import ABC, abstractmethod
 from csv import DictReader
 from random import shuffle
 from typing import Any, TypedDict
@@ -161,14 +162,67 @@ def predict_all(
     return closest
 
 
-def compute_rmse(
-    test_matrix: torch.Tensor, samples: list[tuple[torch.Tensor, torch.Tensor]]
-):
+def unnormalize(preds: torch.Tensor):
+    mn = float(np.min(RATINGS))
+    mx = float(np.max(RATINGS))
+    preds = preds * (mx - mn) + mn
+    rating_candidates = torch.tensor(RATINGS, device=dev)
+    diffs = torch.abs(rating_candidates - preds.unsqueeze(1))
+    closest = torch.argmin(diffs, dim=1)
+    return closest
+
+
+def compute_rmse(test_matrix: torch.Tensor, pred_matrix: torch.Tensor):
     observed = test_matrix != -1
     rmse = torch.sqrt(
-        ((test_matrix[observed] - predict_all(samples, observed)) ** 2).mean()
+        ((test_matrix[observed] - unnormalize(pred_matrix[observed])) ** 2).mean()
     )
     return rmse.item()
+
+
+class Sampler:
+    def __init__(self, matrix: torch.Tensor):
+        self.N, self.M = matrix.shape
+        self._U = torch.randn((self.N, K), device=dev)
+        self._V = torch.randn((self.M, K), device=dev)
+
+    @property
+    def U(self):
+        return self._U
+
+    @property
+    def V(self):
+        return self._V
+
+    @abstractmethod
+    def sample(self):
+        """
+        Sample from the posterior distribution.
+        """
+        pass
+
+
+class MetropolisHastingsSampler(Sampler):
+    def __init__(self, matrix: torch.Tensor, proposal_std: float = PROPOSAL_STD):
+        super().__init__(matrix)
+        self.proposal_std = proposal_std
+        cur_log_post = log_posterior(matrix, U, V)
+
+    def sample(self):
+        # Proposal step: sample new candidate latent vectors (z*) from proposal q(z* | z)
+        U_prop = self._U + torch.randn_like(self._U) * self.proposal_std
+        V_prop = self.V + torch.randn_like(self.V) * self.proposal_std
+
+        # Evaluate posterior of proposed state
+        prop_log_post = log_posterior(matrix, U_prop, V_prop)
+
+        # Compute Metropolis-Hastings acceptance ratio A(z*, z)
+        accept_log_ratio = prop_log_post - cur_log_post
+        # Accept proposal with probability min(1, A(z*, z))
+        if torch.log(torch.rand(1, device=dev)) < accept_log_ratio:
+            U, V = U_prop, V_prop  # type: ignore
+            cur_log_post = prop_log_post
+            accepted_samples += 1
 
 
 def metropolis_hastings(
@@ -185,40 +239,24 @@ def metropolis_hastings(
     V = torch.randn((M, K), device=dev)
     errors: list[tuple[float, int]] = []
 
-    samples: list[tuple[torch.Tensor, torch.Tensor]] = []
-    cur_log_post = log_posterior(matrix, U, V)
+    pred_matrix = torch.zeros((N, M), device=dev)
+    samples: int = 0
     accepted_samples = 0
 
     for i in trange(num_samples):
         try:
-            # Proposal step: sample new candidate latent vectors (z*) from proposal q(z* | z)
-            U_prop = U + torch.randn_like(U) * proposal_std
-            V_prop = V + torch.randn_like(V) * proposal_std
 
-            # Evaluate posterior of proposed state
-            prop_log_post = log_posterior(matrix, U_prop, V_prop)
-
-            # Compute Metropolis-Hastings acceptance ratio A(z*, z)
-            accept_log_ratio = prop_log_post - cur_log_post
-            # Accept proposal with probability min(1, A(z*, z))
-            if torch.log(torch.rand(1, device=dev)) < accept_log_ratio:
-                U, V = U_prop, V_prop  # type: ignore
-                cur_log_post = prop_log_post
-                accepted_samples += 1
-
-            # Store sample (we keep every sample; in practice one could thin to reduce correlation)
+            # Store avg sample
             if i >= burnin and i % thin == 0:
-                # Store the sample
-                samples.append((U.clone(), V.clone()))
-                if len(samples) > ROLLING_WINDOW:
-                    samples.pop(0)
+                samples += 1
+                pred_matrix = (
+                    pred_matrix * (samples - 1) / samples + sigmoid(U @ V.T) / samples
+                )
 
             if i % LOG_AFTER == 0:
                 rmse: float | None = None
-                if len(samples) > 0 and test_matrix is not None:
-                    rmse = compute_rmse(
-                        test_matrix, samples[max(0, len(samples) - ROLLING_WINDOW) :]
-                    )
+                if samples > 0 and test_matrix is not None:
+                    rmse = compute_rmse(test_matrix, pred_matrix)
                     errors.append((rmse, i))
                 tqdm.write(
                     f"[Sample {i}] Log posterior: {cur_log_post.item():.2f}. Accepted: {accepted_samples}, Rate: {accepted_samples / (i + 1):.2f}"
@@ -226,9 +264,9 @@ def metropolis_hastings(
                 )
         except KeyboardInterrupt:
             tqdm.write("Keyboard interrupt. Stopping sampling.")
-            return samples, errors
+            return errors
 
-    return samples, errors
+    return errors
 
 
 class Config(TypedDict):
@@ -273,11 +311,10 @@ def main():
     errors: list[tuple[float, int]] = []
 
     if not os.path.exists("samples.pt"):
-        samples, errors = metropolis_hastings(train_matrix, test_matrix=test_matrix)
+        errors = metropolis_hastings(train_matrix, test_matrix=test_matrix)
         torch.save(samples, "samples.pt")  # type: ignore
         torch.save(errors, "errors.pt")  # type: ignore
     else:
-        samples = torch.load("samples.pt")  # type: ignore
         errors = torch.load("errors.pt")  # type: ignore
 
     # calculate rmse
