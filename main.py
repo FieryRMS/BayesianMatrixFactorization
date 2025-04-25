@@ -4,10 +4,9 @@ import random
 from abc import ABC, abstractmethod
 from csv import DictReader
 from random import shuffle
-from typing import Any, TypedDict
+from typing import TypedDict
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from pydantic import BaseModel
 from tqdm import tqdm, trange
@@ -17,7 +16,7 @@ DATA_PATH = "data/ratings.csv"
 
 # Number of latent dimensions (K), MCMC samples, and rating scale
 K = 5
-RATINGS = np.arange(0.5, 5.5, 0.5)
+RATINGS = torch.arange(0.5, 5.5, 0.5)
 PROPOSAL_STD = 0.002
 NUM_SAMPLES = 200000
 BURNIN = 4000
@@ -61,8 +60,8 @@ def create_matrix(data: list[MovieRating], num_users: int, num_movies: int):
     :param data: Data to create the matrix from.
     :return: Matrix created from the data.
     """
-    mn = np.min(RATINGS)
-    mx = np.max(RATINGS)
+    mn = torch.min(RATINGS)
+    mx = torch.max(RATINGS)
 
     matrix = torch.full((num_users, num_movies), -1.0, dtype=torch.float32)
     for row in data:
@@ -99,72 +98,9 @@ def log_posterior(matrix: torch.Tensor, U: torch.Tensor, V: torch.Tensor):
     return log_likelihood(matrix, U, V) + log_prior(U, V)
 
 
-def predict(
-    samples: list[tuple[torch.Tensor, torch.Tensor]], user_id: int, movie_id: int
-):
-    preds: list[float] = []
-    for U, V in samples:
-        u = U[user_id]
-        v = V[movie_id]
-        pred = sigmoid(u @ v)
-        preds.append(pred.item())
-
-    mn = np.min(RATINGS)
-    mx = np.max(RATINGS)
-
-    avg_pred = np.mean(preds) * (mx - mn) + mn
-    # Rescale back to original ratings
-    rating_candidates = torch.tensor(RATINGS, device=dev)
-    diffs = torch.abs(rating_candidates - float(avg_pred))
-    closest = torch.argmin(diffs).item()
-    return closest
-
-
-def predict_user(
-    samples: list[tuple[torch.Tensor, torch.Tensor]],
-    user_id: int,
-    movie_mask: torch.Tensor,
-):
-    preds: list[torch.Tensor] = []
-    for U, V in samples:
-        u = U[user_id]
-        v = V[movie_mask]
-        pred = sigmoid(u @ v.T)
-        preds.append(pred)
-
-    mn = float(np.min(RATINGS))
-    mx = float(np.max(RATINGS))
-    # avg_pred = torch.mean(torch.stack(preds), dim=0) * (mx - mn) + mn
-    avg_pred = torch.stack(preds).mean(dim=0) * (mx - mn) + mn
-    # Rescale back to original ratings
-    rating_candidates = torch.tensor(RATINGS, device=dev)
-    diffs = torch.abs(rating_candidates - avg_pred.unsqueeze(1))
-    closest = torch.argmin(diffs, dim=1)
-    return closest
-
-
-def predict_all(
-    samples: list[tuple[torch.Tensor, torch.Tensor]],
-    mask: torch.Tensor,
-):
-    preds: list[torch.Tensor] = []
-    for U, V in samples:
-        pred = sigmoid(U @ V.T)
-        preds.append(pred[mask])
-
-    mn = float(np.min(RATINGS))
-    mx = float(np.max(RATINGS))
-    avg_pred = torch.stack(preds).mean(dim=0) * (mx - mn) + mn
-    # Rescale back to original ratings
-    rating_candidates = torch.tensor(RATINGS, device=dev)
-    diffs = torch.abs(rating_candidates - avg_pred.unsqueeze(1))
-    closest = torch.argmin(diffs, dim=1)
-    return closest
-
-
 def unnormalize(preds: torch.Tensor):
-    mn = float(np.min(RATINGS))
-    mx = float(np.max(RATINGS))
+    mn = float(torch.min(RATINGS))
+    mx = float(torch.max(RATINGS))
     preds = preds * (mx - mn) + mn
     rating_candidates = torch.tensor(RATINGS, device=dev)
     diffs = torch.abs(rating_candidates - preds.unsqueeze(1))
@@ -229,7 +165,6 @@ class MetropolisHastingsSampler(Sampler):
         return f"[MH Sampler] Log posterior: {self.cur_log_post.item():.2f}. Accepted: {self.accepted_samples}, Rate: {self.accepted_samples / (self.total_samples):.2f}"
 
 
-
 def run_simulation(
     matrix: torch.Tensor,
     num_samples: int = NUM_SAMPLES,
@@ -276,7 +211,6 @@ class Config(TypedDict):
     random_state: tuple[int, ...]
     rng_state: torch.Tensor
     cuda_rng_state: torch.Tensor
-    numpy_state: dict[str, Any]
 
 
 def init():
@@ -284,7 +218,6 @@ def init():
         with open("config.pkl", "rb") as f:
             config: Config = pickle.load(f)
             random.setstate(config["random_state"])
-            np.random.set_state(config["numpy_state"])
             torch.set_rng_state(config["rng_state"])
             torch.cuda.set_rng_state(config["cuda_rng_state"])
     else:
@@ -292,7 +225,6 @@ def init():
             random_state=random.getstate(),
             rng_state=torch.get_rng_state(),
             cuda_rng_state=torch.cuda.get_rng_state(),
-            numpy_state=np.random.get_state(),
         )
         with open("config.pkl", "wb") as f:
             pickle.dump(config, f)
@@ -318,7 +250,8 @@ def main():
 
     if not os.path.exists("errors.pt"):
         errors = run_simulation(train_matrix, test_matrix=test_matrix)
-        torch.save(errors, "errors.pt")  # type: ignore
+        if errors:
+            torch.save(errors, "errors.pt")  # type: ignore
     else:
         errors = torch.load("errors.pt")  # type: ignore
 
