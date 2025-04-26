@@ -5,3 +5,4 @@ temp*
 *.png
 .pytest_cache
 *pkl
+*.csv

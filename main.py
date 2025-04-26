@@ -23,8 +23,8 @@ K = 5
 RATINGS = torch.arange(0.5, 5.5, 0.5, device=dev)
 PROPOSAL_STD = 0.002
 NUM_SAMPLES = 200000
-BURNIN = 4000
-THIN = 10
+BURNIN = 1000
+THIN = 40
 ROLLING_WINDOW = 200
 LOG_AFTER = 200
 SIGMA2 = 0.1  # Likelihood noise variance
@@ -250,13 +250,10 @@ def main():
     else:
         errors = torch.load("errors.pt")  # type: ignore
 
-    # calculate rmse
-    # print("FINAL RMSE: ", compute_rmse(test_matrix, samples))
-
     # plot errors
     if errors:
-        errors = np.array(errors)  # type: ignore
-        plt.plot(errors[:, 1], errors[:, 0])  # type: ignore
+        errs = torch.tensor(errors)
+        plt.plot(errs[:, 1], errs[:, 0])  # type: ignore
         plt.xlabel("Sample")  # type: ignore
         plt.ylabel("RMSE")  # type: ignore
         plt.title("RMSE over samples")  # type: ignore
