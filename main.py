@@ -9,14 +9,18 @@ from typing import TypedDict
 import matplotlib.pyplot as plt
 import torch
 from pydantic import BaseModel
+from torch import sigmoid
 from tqdm import tqdm, trange
 
 # File path to the ratings dataset
 DATA_PATH = "data/ratings.csv"
 
+dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {dev}")
+
 # Number of latent dimensions (K), MCMC samples, and rating scale
 K = 5
-RATINGS = torch.arange(0.5, 5.5, 0.5)
+RATINGS = torch.arange(0.5, 5.5, 0.5, device=dev)
 PROPOSAL_STD = 0.002
 NUM_SAMPLES = 200000
 BURNIN = 4000
@@ -25,10 +29,6 @@ ROLLING_WINDOW = 200
 LOG_AFTER = 200
 SIGMA2 = 0.1  # Likelihood noise variance
 TEST_SIZE = 0.1  # Fraction of data to use for testing
-
-
-dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {dev}")
 
 
 class MovieRating(BaseModel):
@@ -70,10 +70,6 @@ def create_matrix(data: list[MovieRating], num_users: int, num_movies: int):
     return matrix.to(dev)
 
 
-def sigmoid(x: torch.Tensor):
-    return torch.sigmoid(x)
-
-
 def log_likelihood(matrix: torch.Tensor, U: torch.Tensor, V: torch.Tensor):
     """
     Computes the log-likelihood of observed ratings given latent vectors.
@@ -98,20 +94,19 @@ def log_posterior(matrix: torch.Tensor, U: torch.Tensor, V: torch.Tensor):
     return log_likelihood(matrix, U, V) + log_prior(U, V)
 
 
-def unnormalize(preds: torch.Tensor):
+def predict(preds: torch.Tensor):
     mn = float(torch.min(RATINGS))
     mx = float(torch.max(RATINGS))
     preds = preds * (mx - mn) + mn
-    rating_candidates = torch.tensor(RATINGS, device=dev)
-    diffs = torch.abs(rating_candidates - preds.unsqueeze(1))
+    diffs = torch.abs(RATINGS - preds.unsqueeze(1))
     closest = torch.argmin(diffs, dim=1)
-    return closest
+    return RATINGS[closest]
 
 
 def compute_rmse(test_matrix: torch.Tensor, pred_matrix: torch.Tensor):
     observed = test_matrix >= 0
     rmse = torch.sqrt(
-        ((test_matrix[observed] - unnormalize(pred_matrix[observed])) ** 2).mean()
+        ((test_matrix[observed] - predict(pred_matrix[observed])) ** 2).mean()
     )
     return rmse.item()
 
